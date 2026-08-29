@@ -15,9 +15,9 @@ describe('formatToolLine', () => {
   });
 
   it('Bash 长命令截断到 60 字符', () => {
+    // 钉住确切输出而不是手算总长: 前缀里的 emoji 占 2 个 UTF-16 码元, 手算容易差一
     const line = formatToolLine('Bash', { command: 'x'.repeat(200) });
-    expect(line.length).toBeLessThanOrEqual(70);
-    expect(line).toContain('…');
+    expect(line).toBe(`🔧 Bash \`${'x'.repeat(60)}…\``);
   });
 
   it('Grep / Glob 显示 pattern', () => {
