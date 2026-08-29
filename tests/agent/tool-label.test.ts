@@ -60,4 +60,11 @@ describe('formatToolLine', () => {
   it('换行被压平, 不破坏卡片 markdown', () => {
     expect(formatToolLine('Bash', { command: 'a\nb' })).toBe('🔧 Bash `a b`');
   });
+
+  it('去掉命令里的反引号, 避免提前闭合卡片的 inline code', () => {
+    expect(formatToolLine('Bash', { command: 'echo `date`' })).toBe(
+      '🔧 Bash `echo date`',
+    );
+    expect(formatToolLine('Grep', { pattern: '`x`' })).toBe('🔍 Grep `x`');
+  });
 });
