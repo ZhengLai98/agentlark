@@ -1,0 +1,7 @@
+node_modules/
+runtime/
+user-data/
+.env
+.DS_Store
+coverage/
+*.log
