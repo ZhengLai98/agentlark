@@ -21,8 +21,9 @@ const msg = (overrides: Partial<ParsedMessage> = {}): ParsedMessage => ({
 const makeDeps = (overrides: Record<string, unknown> = {}) => {
   const card = {
     addProgress: vi.fn(),
-    finalize: vi.fn().mockResolvedValue(undefined),
-    fail: vi.fn().mockResolvedValue(undefined),
+    // 新契约: 返回值 = 终态是否真的送达
+    finalize: vi.fn().mockResolvedValue(true),
+    fail: vi.fn().mockResolvedValue(true),
   };
   const sessions = {
     get: vi.fn().mockReturnValue(undefined),
@@ -167,6 +168,57 @@ describe('createMessagePipeline', () => {
     ).resolves.toBeUndefined();
     expect(card.fail).toHaveBeenCalled();
     expect(card.fail.mock.calls[0][0]).toContain('出错');
+  });
+
+  it('/new 清会话抛错时仍然回复用户, 不向上抛', async () => {
+    const { deps, sessions } = makeDeps();
+    sessions.clear.mockImplementation(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+
+    await expect(
+      createMessagePipeline(deps as never)(msg({ text: '/new' })),
+    ).resolves.toBeUndefined();
+    expect(deps.reply).toHaveBeenCalledTimes(1);
+    expect(deps.reply.mock.calls[0][1]).toContain('出错');
+  });
+
+  it('固化 sessionId 抛错不影响已经交付的答案', async () => {
+    const { deps, card, sessions } = makeDeps();
+    sessions.set.mockImplementation(() => {
+      throw new Error('EACCES');
+    });
+
+    await expect(
+      createMessagePipeline(deps as never)(msg()),
+    ).resolves.toBeUndefined();
+    expect(card.finalize).toHaveBeenCalledWith('昨天 PV 是 12345');
+    expect(card.fail).not.toHaveBeenCalled();
+  });
+
+  it('卡片终态没送达时退回纯文本, 答案不丢', async () => {
+    const { deps, card } = makeDeps();
+    card.finalize.mockResolvedValue(false);
+
+    await createMessagePipeline(deps as never)(msg());
+
+    expect(deps.reply).toHaveBeenCalledTimes(1);
+    expect(deps.reply.mock.calls[0][1]).toBe('昨天 PV 是 12345');
+  });
+
+  it('失败终态没送达时同样退回纯文本', async () => {
+    const { deps, card } = makeDeps({
+      runAgent: vi.fn().mockResolvedValue({
+        ok: false,
+        text: '模型调用超时',
+        sessionId: '',
+      }),
+    });
+    card.fail.mockResolvedValue(false);
+
+    await createMessagePipeline(deps as never)(msg());
+
+    expect(deps.reply.mock.calls.at(-1)![1]).toBe('模型调用超时');
   });
 
   it('点表情失败不影响正常流程', async () => {

@@ -9,6 +9,9 @@ import type { RunAgent } from '../types/agent';
 import type { ParsedMessage } from '../types/feishu';
 import { RESET_REPLY, WHOAMI_GROUP_HINT, matchCommand } from './commands';
 
+const READABLE_FAILURE =
+  '处理这条消息时出错了, 请稍后再试。详情见 runtime/logs/bot.log。';
+
 export interface MessagePipelineDeps {
   sessions: SessionStore;
   runAgent: RunAgent;
@@ -25,6 +28,31 @@ export interface MessagePipelineDeps {
 export function createMessagePipeline(
   deps: MessagePipelineDeps,
 ): (msg: ParsedMessage) => Promise<void> {
+  /**
+   * 把终态正文交付给用户。卡片报告没送达 (终态 patch 与续传都失败) 时退回纯文本,
+   * 否则用户会盯着「💭 思考中」等一个已经算出来的答案。
+   */
+  const deliver = async (
+    msg: ParsedMessage,
+    card: StreamCardHandle | null,
+    text: string,
+    failed: boolean,
+  ): Promise<void> => {
+    if (!card) {
+      await deps.reply(msg, text);
+      return;
+    }
+
+    const delivered = failed ? await card.fail(text) : await card.finalize(text);
+    if (delivered) return;
+
+    deps.logger.warn(
+      { chatId: msg.chatId },
+      'message: card delivery failed, falling back to plain text',
+    );
+    await deps.reply(msg, text);
+  };
+
   return async (msg) => {
     // 表情回执是尽力而为, 失败不影响回答
     await deps.react(msg.messageId).catch(() => undefined);
@@ -33,23 +61,34 @@ export function createMessagePipeline(
 
     const command = matchCommand(msg.text);
     if (command) {
-      switch (command.kind) {
-        case 'reset':
-          deps.sessions.clear(key);
-          await deps.reply(msg, RESET_REPLY);
-          return;
-        case 'whoami':
-          await deps.reply(
-            msg,
-            msg.chatType === 'group'
-              ? WHOAMI_GROUP_HINT
-              : `你的 open_id: ${msg.senderOpenId}`,
-          );
-          return;
-        case 'canned':
-          await deps.reply(msg, command.text);
-          return;
+      // 指令分支同样要包在错误处理里: sessions.clear 会同步写盘,
+      // 磁盘满/权限问题会一路抛穿流水线, 最终把整个进程带走。
+      try {
+        switch (command.kind) {
+          case 'reset':
+            deps.sessions.clear(key);
+            await deps.reply(msg, RESET_REPLY);
+            break;
+          case 'whoami':
+            await deps.reply(
+              msg,
+              msg.chatType === 'group'
+                ? WHOAMI_GROUP_HINT
+                : `你的 open_id: ${msg.senderOpenId}`,
+            );
+            break;
+          case 'canned':
+            await deps.reply(msg, command.text);
+            break;
+        }
+      } catch (error) {
+        deps.logger.error(
+          { err: error, chatId: msg.chatId },
+          'message: command failed',
+        );
+        await deps.reply(msg, READABLE_FAILURE);
       }
+      return;
     }
 
     let card: StreamCardHandle | null = null;
@@ -78,21 +117,25 @@ export function createMessagePipeline(
         },
       );
 
-      if (result.ok) {
-        deps.sessions.set(key, result.sessionId);
-        if (card) await card.finalize(result.text);
-        else await deps.reply(msg, result.text);
+      if (!result.ok) {
+        deps.logger.warn({ chatId: msg.chatId }, 'message: agent reported failure');
+        await deliver(msg, card, result.text, true);
         return;
       }
 
-      deps.logger.warn({ chatId: msg.chatId }, 'message: agent reported failure');
-      if (card) await card.fail(result.text);
-      else await deps.reply(msg, result.text);
+      // 先交付再落盘: 会话持久化是下一轮的事, 不该让一次 fs 抛错吃掉已经算出来的答案
+      await deliver(msg, card, result.text, false);
+      try {
+        deps.sessions.set(key, result.sessionId);
+      } catch (error) {
+        deps.logger.error(
+          { err: error, chatId: msg.chatId },
+          'message: persist session failed, context will not resume',
+        );
+      }
     } catch (error) {
       deps.logger.error({ err: error, chatId: msg.chatId }, 'message: pipeline failed');
-      const readable = '处理这条消息时出错了, 请稍后再试。详情见 runtime/logs/bot.log。';
-      if (card) await card.fail(readable);
-      else await deps.reply(msg, readable);
+      await deliver(msg, card, READABLE_FAILURE, true);
     }
   };
 }
