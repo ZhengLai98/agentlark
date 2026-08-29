@@ -21,6 +21,7 @@ const opts = (overrides: Partial<Parameters<typeof filterMessage>[1]> = {}) => (
   botOpenId: 'ou_bot',
   ignoreAtAll: true,
   allowedGroupChats: [] as string[],
+  allowedUsers: [] as string[],
   seen: new BoundedSet(100),
   ...overrides,
 });
@@ -45,6 +46,33 @@ describe('filterMessage', () => {
     expect(filterMessage(msg({ senderOpenId: 'ou_bot' }), opts())).toEqual({
       action: 'drop',
       reason: 'self',
+    });
+  });
+
+  it('人白名单留空时允许全部人', () => {
+    expect(filterMessage(msg(), opts({ allowedUsers: [] }))).toEqual({
+      action: 'process',
+    });
+  });
+
+  it('白名单里的发送人放行', () => {
+    expect(
+      filterMessage(msg(), opts({ allowedUsers: ['ou_other', 'ou_sender'] })),
+    ).toEqual({ action: 'process' });
+  });
+
+  it('不在人白名单里的发送人被丢弃', () => {
+    expect(filterMessage(msg(), opts({ allowedUsers: ['ou_other'] }))).toEqual({
+      action: 'drop',
+      reason: 'user-not-allowed',
+    });
+  });
+
+  it('人白名单对群聊同样生效', () => {
+    const m = msg({ chatType: 'group', mentions: [atBot] });
+    expect(filterMessage(m, opts({ allowedUsers: ['ou_other'] }))).toEqual({
+      action: 'drop',
+      reason: 'user-not-allowed',
     });
   });
 

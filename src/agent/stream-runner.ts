@@ -19,7 +19,12 @@ const STDERR_TAIL = 600;
 export interface ChildProcessLike {
   stdout: EventEmitter;
   stderr: EventEmitter;
-  stdin: { write(data: string): void; end(): void };
+  stdin: {
+    write(data: string, callback?: (error?: Error | null) => void): void;
+    end(): void;
+    /** 必须监听: 无监听器时 Node 的 stream 'error' 会抛到 uncaughtException, 直接带走整个进程。 */
+    on(event: 'error', listener: (error: Error) => void): void;
+  };
   on(event: 'close' | 'error', listener: (...args: any[]) => void): void;
   kill(signal?: NodeJS.Signals): boolean;
 }
@@ -65,6 +70,7 @@ export function createAgentRunner(deps: AgentRunnerDeps): RunAgent {
       let streamedText = '';
       let stderrTail = '';
       let settled = false;
+      let stdinFailed = false;
 
       const parser = createStreamParser((event) => {
         if (event.type === 'session') sessionId = event.sessionId;
@@ -162,20 +168,44 @@ export function createAgentRunner(deps: AgentRunnerDeps): RunAgent {
         }
 
         deps.logger.error(
-          { code, stderrTail },
+          { code, stderrTail, stdinFailed },
           'agent: exited without a result line',
         );
         const detail = stderrTail.trim();
+        if (detail) {
+          settle({
+            ok: false,
+            text: `模型执行失败 (退出码 ${code}):\n\`\`\`\n${detail}\n\`\`\``,
+            sessionId,
+          });
+          return;
+        }
         settle({
           ok: false,
-          text: detail
-            ? `模型执行失败 (退出码 ${code}):\n\`\`\`\n${detail}\n\`\`\``
+          text: stdinFailed
+            ? `模型执行失败 (退出码 ${code}): 提示词没能写进子进程 stdin (管道已关闭)。多半是续接的会话 id 已失效, 发 /new 再问一次。`
             : `模型执行失败 (退出码 ${code}), 且没有输出。详见 runtime/logs/bot.log。`,
           sessionId,
         });
       });
 
-      child.stdin.write(input.prompt);
-      child.stdin.end();
+      // stdin 失败不直接 settle: 走 close 分支的常规失败路径, 那里能带上 stderr 尾巴,
+      // 对用户更有信息量; 子进程真卡死时还有 timeoutTimer 兜底。
+      const onStdinError = (error: unknown): void => {
+        stdinFailed = true;
+        deps.logger.warn({ err: error, bin: deps.bin }, 'agent: stdin failed');
+      };
+
+      child.stdin.on('error', onStdinError);
+
+      try {
+        child.stdin.write(input.prompt, (error) => {
+          if (error) onStdinError(error);
+        });
+        child.stdin.end();
+      } catch (error) {
+        // write/end 也可能同步抛 (如 write after end); 绝不能逃出 Promise executor
+        onStdinError(error);
+      }
     });
 }

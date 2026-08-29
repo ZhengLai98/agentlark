@@ -36,7 +36,12 @@ export const envSchema = z.object({
 
   IGNORE_AT_ALL: boolEnv(true),
   ALLOWED_GROUP_CHATS: z.string().default(''),
-  WORKSPACE_DIR: z.string().min(1).default(process.cwd()),
+  ALLOWED_USERS: z.string().default(''),
+  // 刻意没有默认值: 默认成 cwd 会把带 .env 的仓库根塞进 bypassPermissions 沙箱,
+  // 详见 config/workspace.ts。必须由操作者显式指定一个独立目录。
+  WORKSPACE_DIR: z
+    .string({ required_error: 'WORKSPACE_DIR is required' })
+    .min(1, 'WORKSPACE_DIR is required'),
   SESSION_MAX_IDLE_HOURS: numEnv(24, (s) => s.nonnegative()),
 
   LOG_LEVEL: z
@@ -59,10 +64,20 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   throw new Error(`Invalid environment configuration:\n${lines.join('\n')}`);
 }
 
-/** 群白名单: 留空 = 允许全部群。 */
-export function parseAllowedGroupChats(raw: string): string[] {
+/** 逗号分隔列表 → 去空白去空项。 */
+function parseCsv(raw: string): string[] {
   return raw
     .split(',')
     .map((item) => item.trim())
     .filter((item) => item.length > 0);
+}
+
+/** 群白名单: 留空 = 允许全部群。 */
+export function parseAllowedGroupChats(raw: string): string[] {
+  return parseCsv(raw);
+}
+
+/** 发送人白名单 (open_id): 留空 = 允许全部人, 与群白名单口径一致。 */
+export function parseAllowedUsers(raw: string): string[] {
+  return parseCsv(raw);
 }

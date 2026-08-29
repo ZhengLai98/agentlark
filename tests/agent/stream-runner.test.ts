@@ -5,10 +5,16 @@ import type { AgentEvent } from '../../src/types/agent';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
+/** stdin 必须是真的 EventEmitter: 只有这样才能复现「无 error 监听器 → emit 抛错」的生产行为。 */
+class FakeStdin extends EventEmitter {
+  write = vi.fn();
+  end = vi.fn();
+}
+
 class FakeChild extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = { write: vi.fn(), end: vi.fn() };
+  stdin = new FakeStdin();
   kill = vi.fn(() => true);
 
   emitLine(payload: unknown): void {
@@ -40,7 +46,8 @@ describe('createAgentRunner', () => {
     const { run, spawnFn } = makeRunner(child);
 
     const promise = run({ prompt: '帮我查一下 PV' }, () => {});
-    expect(child.stdin.write).toHaveBeenCalledWith('帮我查一下 PV');
+    // write 第二个参数是 error 回调 (EPIPE 降级), 这里只断言正文
+    expect(child.stdin.write.mock.calls[0]![0]).toBe('帮我查一下 PV');
     expect(child.stdin.end).toHaveBeenCalled();
     expect(spawnFn.mock.calls[0][1]).not.toContain('帮我查一下 PV');
 
@@ -160,6 +167,43 @@ describe('createAgentRunner', () => {
     const result = await promise;
     expect(result.ok).toBe(false);
     expect(result.text).toContain('AGENT_BIN');
+  });
+
+  it('stdin 报 EPIPE 不炸进程, 降级成可读失败', async () => {
+    const child = new FakeChild();
+    const { run } = makeRunner(child);
+
+    const promise = run({ prompt: 'hi' }, () => {});
+
+    // 没有 error 监听器时 emit('error') 会同步抛出 → 生产里就是 uncaughtException
+    expect(() =>
+      child.stdin.emit(
+        'error',
+        Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }),
+      ),
+    ).not.toThrow();
+
+    child.stderr.emit('data', 'No conversation found with session ID\n');
+    child.emit('close', 1);
+
+    const result = await promise;
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain('No conversation found');
+  });
+
+  it('stdin.write 同步抛错时仍 resolve 成可读失败, 不 reject', async () => {
+    const child = new FakeChild();
+    child.stdin.write.mockImplementation(() => {
+      throw new Error('write after end');
+    });
+    const { run } = makeRunner(child);
+
+    const promise = run({ prompt: 'hi' }, () => {});
+    child.emit('close', 1);
+
+    const result = await promise;
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain('stdin');
   });
 
   it('超时后 kill 子进程并返回超时提示', async () => {

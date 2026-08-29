@@ -12,7 +12,12 @@ import { startDispatcher } from './feishu/dispatcher';
 import { reactTyping } from './feishu/react';
 import { createReplier } from './feishu/reply';
 import { openStreamCard } from './feishu/stream-card';
-import { parseAllowedGroupChats, loadEnv } from './config/env';
+import {
+  loadEnv,
+  parseAllowedGroupChats,
+  parseAllowedUsers,
+} from './config/env';
+import { assertWorkspaceIsolated } from './config/workspace';
 import { filterMessage } from './handler/filter';
 import { createMessagePipeline } from './handler/message';
 import { BoundedSet } from './infra/bounded-set';
@@ -24,6 +29,12 @@ const DEDUPE_CAPACITY = 10_000;
 
 async function main(): Promise<void> {
   const env = loadEnv();
+
+  // 启动即拒: 工作目录不能是本仓库自己 (或它的上级), 否则 .env 里的 app secret
+  // 就躺在 bypassPermissions 沙箱里, 任何飞书用户都能让模型读出来。
+  const workspaceDir = resolve(env.WORKSPACE_DIR);
+  assertWorkspaceIsolated(workspaceDir, process.cwd());
+
   const logger = createLogger(env.LOG_LEVEL);
 
   const requester = createLarkClient(env.FEISHU_APP_ID, env.FEISHU_APP_SECRET);
@@ -40,7 +51,7 @@ async function main(): Promise<void> {
     model: env.AGENT_MODEL,
     permissionMode: env.AGENT_PERMISSION_MODE,
     timeoutMs: env.AGENT_TIMEOUT_MS,
-    cwd: resolve(env.WORKSPACE_DIR),
+    cwd: workspaceDir,
     logger,
   });
 
@@ -59,6 +70,7 @@ async function main(): Promise<void> {
 
   const seen = new BoundedSet(DEDUPE_CAPACITY);
   const allowedGroupChats = parseAllowedGroupChats(env.ALLOWED_GROUP_CHATS);
+  const allowedUsers = parseAllowedUsers(env.ALLOWED_USERS);
   const lock = new ChatLock();
 
   startDispatcher({
@@ -70,6 +82,7 @@ async function main(): Promise<void> {
         botOpenId,
         ignoreAtAll: env.IGNORE_AT_ALL,
         allowedGroupChats,
+        allowedUsers,
         seen,
       });
 
@@ -81,8 +94,15 @@ async function main(): Promise<void> {
         return;
       }
 
-      // 同一会话串行, 防并发争抢 session
-      void lock.run(sessionKey(msg), () => pipeline(msg));
+      // 同一会话串行, 防并发争抢 session。
+      // 这里必须自己 catch: ChatLock.run 会把任务的 rejection 透出来, 漏一个
+      // 就是 unhandledRejection → process.exit(1), 一个人的消息带走全租户。
+      void lock.run(sessionKey(msg), () => pipeline(msg)).catch((error) => {
+        logger.error(
+          { err: error, messageId: msg.messageId, chatId: msg.chatId },
+          'index: pipeline rejected',
+        );
+      });
     },
   });
 
