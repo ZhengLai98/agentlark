@@ -32,7 +32,14 @@ export function handleMessageEvent(
   }
 }
 
-/** 建立飞书 WebSocket 长连接并订阅 im.message.receive_v1。 */
+/**
+ * 建立飞书 WebSocket 长连接并订阅 im.message.receive_v1。
+ *
+ * 「started」只能由 onReady (握手真的成功) 触发: README 与人工验收清单都拿这行当
+ * 存活证据, 在 start() 之后无条件打印会让 app secret 配错、事件订阅没配的进程
+ * 一样报成功, 随后才甩出一个没人接的 rejection。完整的重连韧性属于 Plan 4,
+ * 这里只把启动信号变诚实。
+ */
 export function startDispatcher(deps: DispatcherDeps): void {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (data: unknown) => {
@@ -44,8 +51,15 @@ export function startDispatcher(deps: DispatcherDeps): void {
     appId: deps.appId,
     appSecret: deps.appSecret,
     domain: Lark.Domain.Feishu,
+    onReady: () => deps.logger.info('index: dispatcher started'),
+    onError: (err: Error) =>
+      deps.logger.fatal({ err }, 'dispatcher: websocket connection failed'),
+    onReconnecting: () =>
+      deps.logger.warn('dispatcher: websocket reconnecting'),
+    onReconnected: () => deps.logger.info('dispatcher: websocket reconnected'),
   });
 
-  wsClient.start({ eventDispatcher });
-  deps.logger.info('index: dispatcher started');
+  void wsClient.start({ eventDispatcher }).catch((error: unknown) => {
+    deps.logger.fatal({ err: error }, 'dispatcher: websocket start failed');
+  });
 }

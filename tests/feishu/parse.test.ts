@@ -51,6 +51,20 @@ describe('parseMessageEvent', () => {
     ]);
   });
 
+  it('@_user_10 不会被 @_user_1 吃掉前缀', () => {
+    const parsed = parseMessageEvent(
+      textEvent({
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 @_user_10 帮我看下' }),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'agentlark' },
+          { key: '@_user_10', id: { open_id: 'ou_tenth' }, name: '同事十' },
+        ],
+      }),
+    );
+    expect(parsed?.text).toBe('帮我看下');
+  });
+
   it('识别 @全体成员', () => {
     const parsed = parseMessageEvent(
       textEvent({

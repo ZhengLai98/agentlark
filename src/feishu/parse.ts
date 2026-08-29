@@ -25,10 +25,18 @@ function readMentions(raw: unknown): MentionRef[] {
   return result;
 }
 
-/** 去掉 @占位符, 合并多余空格但保留换行 (代码块/多段问题要留结构)。 */
+/**
+ * 去掉 @占位符, 合并多余空格但保留换行 (代码块/多段问题要留结构)。
+ *
+ * 必须按 key 长度倒序剥离: 飞书的占位符是 @_user_1 … @_user_N, 数组顺序即编号顺序,
+ * 先剥 "@_user_1" 会吃掉 "@_user_10" 的前缀, 在正文里留下一个孤零零的 "0"。
+ */
 function stripMentions(text: string, mentions: MentionRef[]): string {
   let out = text;
-  for (const mention of mentions) out = out.split(mention.key).join('');
+  const byKeyLengthDesc = [...mentions].sort(
+    (a, b) => b.key.length - a.key.length,
+  );
+  for (const mention of byKeyLengthDesc) out = out.split(mention.key).join('');
   out = out.split(AT_ALL_KEY).join('');
   return out.replace(/[ \t]{2,}/g, ' ').trim();
 }

@@ -1,8 +1,39 @@
-import { describe, expect, it, vi } from 'vitest';
-import { handleMessageEvent } from '../../src/feishu/dispatcher';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  handleMessageEvent,
+  startDispatcher,
+} from '../../src/feishu/dispatcher';
 import type { ParsedMessage } from '../../src/types/feishu';
 
-const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+const { wsInstances, wsState } = vi.hoisted(() => ({
+  wsInstances: [] as Array<{ params: any; start: ReturnType<typeof vi.fn> }>,
+  wsState: { startRejection: null as Error | null },
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class WSClient {
+    start = vi.fn(() =>
+      wsState.startRejection
+        ? Promise.reject(wsState.startRejection)
+        : Promise.resolve(),
+    );
+    constructor(readonly params: any) {
+      wsInstances.push(this as never);
+    }
+  }
+  class EventDispatcher {
+    register = vi.fn().mockReturnThis();
+  }
+  return { WSClient, EventDispatcher, Domain: { Feishu: 'feishu' } };
+});
+
+const logger = {
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+  fatal: vi.fn(),
+};
 
 const rawTextEvent = {
   sender: { sender_id: { open_id: 'ou_sender' }, sender_type: 'user' },
@@ -46,5 +77,65 @@ describe('handleMessageEvent', () => {
         throw new Error('boom');
       }),
     ).not.toThrow();
+  });
+});
+
+describe('startDispatcher', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    wsInstances.length = 0;
+    wsState.startRejection = null;
+  });
+
+  const start = () =>
+    startDispatcher({
+      appId: 'cli_test',
+      appSecret: 'secret',
+      logger: logger as never,
+      onMessage: vi.fn(),
+    });
+
+  it('握手成功前不打 started, onReady 才打', () => {
+    start();
+    expect(logger.info).not.toHaveBeenCalledWith('index: dispatcher started');
+
+    wsInstances[0]!.params.onReady();
+    expect(logger.info).toHaveBeenCalledWith('index: dispatcher started');
+  });
+
+  it('连接失败记 fatal', () => {
+    start();
+    wsInstances[0]!.params.onError(new Error('invalid app secret'));
+    expect(logger.fatal).toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalledWith('index: dispatcher started');
+  });
+
+  it('重连过程记 warn / info', () => {
+    start();
+    wsInstances[0]!.params.onReconnecting();
+    expect(logger.warn).toHaveBeenCalledWith('dispatcher: websocket reconnecting');
+    wsInstances[0]!.params.onReconnected();
+    expect(logger.info).toHaveBeenCalledWith('dispatcher: websocket reconnected');
+  });
+
+  it('订阅时把 eventDispatcher 交给 start()', () => {
+    start();
+    expect(wsInstances[0]!.start).toHaveBeenCalledWith(
+      expect.objectContaining({ eventDispatcher: expect.anything() }),
+    );
+  });
+
+  it('start() 的 rejection 被接住并记 fatal, 不变成 unhandledRejection', async () => {
+    const boom = new Error('boom');
+    wsState.startRejection = boom;
+
+    expect(() => start()).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(logger.fatal).toHaveBeenCalledWith(
+      { err: boom },
+      'dispatcher: websocket start failed',
+    );
   });
 });
