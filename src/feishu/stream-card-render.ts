@@ -41,6 +41,11 @@ function build(state: CardState, progress: string[]): object {
 /**
  * 纯函数: 状态 → 卡片 JSON。超过 30KB 时从最早的进度行开始裁,
  * 保证「最新进度 + 答案」永远留得下 (答案本身由 markdown 硬限收敛)。
+ *
+ * 用 Buffer.byteLength(..., 'utf8') 而不是 String.length: spec 的 30KB 是字节口径,
+ * 而 .length 数的是 UTF-16 码元 —— 中文/emoji 一个字符占 3+ 字节却只算 1,
+ * 用 .length 量会让闸门少算最多 3 倍, 卡片超限被飞书拒收后 patch 连续失败,
+ * 续传的新卡同样超限, 内容彻底卡死。
  */
 export function renderCard(state: CardState): {
   card: object;
@@ -51,7 +56,7 @@ export function renderCard(state: CardState): {
   let dropped = 0;
 
   while (
-    JSON.stringify(card).length > MAX_CARD_BYTES &&
+    Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES &&
     progress.length > 0
   ) {
     // 每轮至少裁一行, 行数多时按比例加速收敛

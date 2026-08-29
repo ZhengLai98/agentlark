@@ -58,7 +58,9 @@ describe('renderCard', () => {
       failed: false,
     });
 
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
     expect(droppedProgress).toBeGreaterThan(0);
     expect(JSON.stringify(card)).toContain('<399>');
     expect(JSON.stringify(card)).not.toContain('<000>');
@@ -70,7 +72,25 @@ describe('renderCard', () => {
       answer: '字'.repeat(50000),
       failed: false,
     });
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
+  });
+
+  it('按 UTF-8 字节而不是字符数裁剪 (中文一个字 3 字节)', () => {
+    // 12000 行 × 每行 4 个中文字: 字符数远低于 30000, 字节数远超
+    const progress = Array.from({ length: 12000 }, (_, i) => `🔧 执行中 ${i}`);
+    const { card, droppedProgress } = renderCard({
+      progress,
+      answer: '',
+      failed: false,
+    });
+
+    const json = JSON.stringify(card);
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(droppedProgress).toBeGreaterThan(0);
+    // 守住回归: 若用 .length 量, 这张卡会被判为“未超限”而不裁
+    expect(json.length).toBeLessThan(MAX_CARD_BYTES);
   });
 
   it('failed 状态渲染红色标题', () => {
