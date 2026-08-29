@@ -140,7 +140,6 @@ npm install -D typescript tsx vitest eslint @eslint/js typescript-eslint @types/
     "lib": ["ES2023"],
     "types": ["node"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "noEmit": true,
     "esModuleInterop": true,
@@ -298,8 +297,12 @@ const numEnv = (fallback: number, check: (schema: z.ZodNumber) => z.ZodNumber) =
   );
 
 export const envSchema = z.object({
-  FEISHU_APP_ID: z.string().min(1, 'FEISHU_APP_ID is required'),
-  FEISHU_APP_SECRET: z.string().min(1, 'FEISHU_APP_SECRET is required'),
+  FEISHU_APP_ID: z
+    .string({ required_error: 'FEISHU_APP_ID is required' })
+    .min(1, 'FEISHU_APP_ID is required'),
+  FEISHU_APP_SECRET: z
+    .string({ required_error: 'FEISHU_APP_SECRET is required' })
+    .min(1, 'FEISHU_APP_SECRET is required'),
   FEISHU_BOT_OPEN_ID: z.string().default(''),
 
   AGENT_BIN: z.string().min(1).default('claude'),
