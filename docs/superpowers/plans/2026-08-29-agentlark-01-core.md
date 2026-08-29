@@ -2074,7 +2074,9 @@ describe('renderCard', () => {
       failed: false,
     });
 
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
     expect(droppedProgress).toBeGreaterThan(0);
     expect(JSON.stringify(card)).toContain('<399>');
     expect(JSON.stringify(card)).not.toContain('<000>');
@@ -2086,7 +2088,25 @@ describe('renderCard', () => {
       answer: '字'.repeat(50000),
       failed: false,
     });
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
+  });
+
+  it('按 UTF-8 字节而不是字符数裁剪 (中文一个字 3 字节)', () => {
+    // 12000 行 × 每行 4 个中文字: 字符数远低于 30000, 字节数远超
+    const progress = Array.from({ length: 12000 }, (_, i) => `\u{1f527} 执行中 ${i}`);
+    const { card, droppedProgress } = renderCard({
+      progress,
+      answer: '',
+      failed: false,
+    });
+
+    const json = JSON.stringify(card);
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(droppedProgress).toBeGreaterThan(0);
+    // 守住回归: 若用 .length 量, 这张卡会被判为“未超限”而不裁
+    expect(json.length).toBeLessThan(MAX_CARD_BYTES);
   });
 
   it('failed 状态渲染红色标题', () => {
@@ -2307,6 +2327,11 @@ function build(state: CardState, progress: string[]): object {
 /**
  * 纯函数: 状态 → 卡片 JSON。超过 30KB 时从最早的进度行开始裁,
  * 保证「最新进度 + 答案」永远留得下 (答案本身由 markdown 硬限收敛)。
+ *
+ * 用 Buffer.byteLength(..., 'utf8') 而不是 String.length: spec 的 30KB 是字节口径,
+ * 而 .length 数的是 UTF-16 码元 —— 中文/emoji 一个字符占 3+ 字节却只算 1,
+ * 用 .length 量会让闸门少算最多 3 倍, 卡片超限被飞书拒收后 patch 连续失败,
+ * 续传的新卡同样超限, 内容彻底卡死。
  */
 export function renderCard(state: CardState): {
   card: object;
@@ -2317,7 +2342,7 @@ export function renderCard(state: CardState): {
   let dropped = 0;
 
   while (
-    JSON.stringify(card).length > MAX_CARD_BYTES &&
+    Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES &&
     progress.length > 0
   ) {
     // 每轮至少裁一行, 行数多时按比例加速收敛
@@ -2711,9 +2736,9 @@ describe('formatToolLine', () => {
   });
 
   it('Bash 长命令截断到 60 字符', () => {
+    // 钉住确切输出而不是手算总长: 前缀里的 emoji 占 2 个 UTF-16 码元, 手算容易差一
     const line = formatToolLine('Bash', { command: 'x'.repeat(200) });
-    expect(line.length).toBeLessThanOrEqual(70);
-    expect(line).toContain('…');
+    expect(line).toBe(`\u{1f527} Bash \`${'x'.repeat(60)}\u2026\``);
   });
 
   it('Grep / Glob 显示 pattern', () => {
@@ -2756,13 +2781,20 @@ describe('formatToolLine', () => {
   it('换行被压平, 不破坏卡片 markdown', () => {
     expect(formatToolLine('Bash', { command: 'a\nb' })).toBe('🔧 Bash `a b`');
   });
+
+  it('去掉命令里的反引号, 避免提前闭合卡片的 inline code', () => {
+    expect(formatToolLine('Bash', { command: 'echo `date`' })).toBe(
+      '🔧 Bash `echo date`',
+    );
+    expect(formatToolLine('Grep', { pattern: '`x`' })).toBe('🔍 Grep `x`');
+  });
 });
 ```
 
 - [ ] **Step 2: 写 tests/agent/stream-parser.test.ts（失败的测试）**
 
 ```ts
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { createStreamParser } from '../../src/agent/stream-parser';
 import type { AgentEvent } from '../../src/types/agent';
 
@@ -2957,9 +2989,15 @@ const asRecord = (value: unknown): Record<string, unknown> =>
 const str = (value: unknown): string =>
   typeof value === 'string' ? value : '';
 
-/** 压平换行并截断, 保证进度行不破坏卡片 markdown 结构。 */
+/**
+ * 压平换行、去掉反引号并截断, 保证进度行不破坏卡片 markdown 结构。
+ *
+ * 反引号必须去掉: 进度行把命令包在 `...` 里, 命令自带反引号会把这段 inline code
+ * 提前闭合, 卡片上显示成一截乱码 —— `echo \`date\`` 这种老式命令替换很常见。
+ * 进度行是给人扫一眼用的, 不是可复制执行的命令, 丢掉反引号可以接受。
+ */
 function clip(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
+  const flat = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
   return flat.length > MAX_DETAIL ? `${flat.slice(0, MAX_DETAIL)}…` : flat;
 }
 
@@ -3175,7 +3213,9 @@ class FakeChild extends EventEmitter {
 }
 
 const makeRunner = (child: FakeChild, overrides = {}) => {
-  const spawnFn = vi.fn(() => child);
+  // 用 mockReturnValue 而不是 vi.fn(() => child): 后者会把调用签名推成零参,
+  // 让 spawnFn.mock.calls[0][1] 过不了 tsc --noEmit
+  const spawnFn = vi.fn().mockReturnValue(child);
   const run = createAgentRunner({
     bin: 'claude',
     model: '',
