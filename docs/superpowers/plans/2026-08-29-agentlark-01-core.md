@@ -140,7 +140,6 @@ npm install -D typescript tsx vitest eslint @eslint/js typescript-eslint @types/
     "lib": ["ES2023"],
     "types": ["node"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "noEmit": true,
     "esModuleInterop": true,
@@ -298,8 +297,12 @@ const numEnv = (fallback: number, check: (schema: z.ZodNumber) => z.ZodNumber) =
   );
 
 export const envSchema = z.object({
-  FEISHU_APP_ID: z.string().min(1, 'FEISHU_APP_ID is required'),
-  FEISHU_APP_SECRET: z.string().min(1, 'FEISHU_APP_SECRET is required'),
+  FEISHU_APP_ID: z
+    .string({ required_error: 'FEISHU_APP_ID is required' })
+    .min(1, 'FEISHU_APP_ID is required'),
+  FEISHU_APP_SECRET: z
+    .string({ required_error: 'FEISHU_APP_SECRET is required' })
+    .min(1, 'FEISHU_APP_SECRET is required'),
   FEISHU_BOT_OPEN_ID: z.string().default(''),
 
   AGENT_BIN: z.string().min(1).default('claude'),
@@ -2071,7 +2074,9 @@ describe('renderCard', () => {
       failed: false,
     });
 
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
     expect(droppedProgress).toBeGreaterThan(0);
     expect(JSON.stringify(card)).toContain('<399>');
     expect(JSON.stringify(card)).not.toContain('<000>');
@@ -2083,7 +2088,25 @@ describe('renderCard', () => {
       answer: '字'.repeat(50000),
       failed: false,
     });
-    expect(JSON.stringify(card).length).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(
+      Buffer.byteLength(JSON.stringify(card), 'utf8'),
+    ).toBeLessThanOrEqual(MAX_CARD_BYTES);
+  });
+
+  it('按 UTF-8 字节而不是字符数裁剪 (中文一个字 3 字节)', () => {
+    // 12000 行 × 每行 4 个中文字: 字符数远低于 30000, 字节数远超
+    const progress = Array.from({ length: 12000 }, (_, i) => `\u{1f527} 执行中 ${i}`);
+    const { card, droppedProgress } = renderCard({
+      progress,
+      answer: '',
+      failed: false,
+    });
+
+    const json = JSON.stringify(card);
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThanOrEqual(MAX_CARD_BYTES);
+    expect(droppedProgress).toBeGreaterThan(0);
+    // 守住回归: 若用 .length 量, 这张卡会被判为“未超限”而不裁
+    expect(json.length).toBeLessThan(MAX_CARD_BYTES);
   });
 
   it('failed 状态渲染红色标题', () => {
@@ -2304,6 +2327,11 @@ function build(state: CardState, progress: string[]): object {
 /**
  * 纯函数: 状态 → 卡片 JSON。超过 30KB 时从最早的进度行开始裁,
  * 保证「最新进度 + 答案」永远留得下 (答案本身由 markdown 硬限收敛)。
+ *
+ * 用 Buffer.byteLength(..., 'utf8') 而不是 String.length: spec 的 30KB 是字节口径,
+ * 而 .length 数的是 UTF-16 码元 —— 中文/emoji 一个字符占 3+ 字节却只算 1,
+ * 用 .length 量会让闸门少算最多 3 倍, 卡片超限被飞书拒收后 patch 连续失败,
+ * 续传的新卡同样超限, 内容彻底卡死。
  */
 export function renderCard(state: CardState): {
   card: object;
@@ -2314,7 +2342,7 @@ export function renderCard(state: CardState): {
   let dropped = 0;
 
   while (
-    JSON.stringify(card).length > MAX_CARD_BYTES &&
+    Buffer.byteLength(JSON.stringify(card), 'utf8') > MAX_CARD_BYTES &&
     progress.length > 0
   ) {
     // 每轮至少裁一行, 行数多时按比例加速收敛
@@ -2708,9 +2736,9 @@ describe('formatToolLine', () => {
   });
 
   it('Bash 长命令截断到 60 字符', () => {
+    // 钉住确切输出而不是手算总长: 前缀里的 emoji 占 2 个 UTF-16 码元, 手算容易差一
     const line = formatToolLine('Bash', { command: 'x'.repeat(200) });
-    expect(line.length).toBeLessThanOrEqual(70);
-    expect(line).toContain('…');
+    expect(line).toBe(`\u{1f527} Bash \`${'x'.repeat(60)}\u2026\``);
   });
 
   it('Grep / Glob 显示 pattern', () => {
@@ -2753,13 +2781,20 @@ describe('formatToolLine', () => {
   it('换行被压平, 不破坏卡片 markdown', () => {
     expect(formatToolLine('Bash', { command: 'a\nb' })).toBe('🔧 Bash `a b`');
   });
+
+  it('去掉命令里的反引号, 避免提前闭合卡片的 inline code', () => {
+    expect(formatToolLine('Bash', { command: 'echo `date`' })).toBe(
+      '🔧 Bash `echo date`',
+    );
+    expect(formatToolLine('Grep', { pattern: '`x`' })).toBe('🔍 Grep `x`');
+  });
 });
 ```
 
 - [ ] **Step 2: 写 tests/agent/stream-parser.test.ts（失败的测试）**
 
 ```ts
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { createStreamParser } from '../../src/agent/stream-parser';
 import type { AgentEvent } from '../../src/types/agent';
 
@@ -2954,9 +2989,15 @@ const asRecord = (value: unknown): Record<string, unknown> =>
 const str = (value: unknown): string =>
   typeof value === 'string' ? value : '';
 
-/** 压平换行并截断, 保证进度行不破坏卡片 markdown 结构。 */
+/**
+ * 压平换行、去掉反引号并截断, 保证进度行不破坏卡片 markdown 结构。
+ *
+ * 反引号必须去掉: 进度行把命令包在 `...` 里, 命令自带反引号会把这段 inline code
+ * 提前闭合, 卡片上显示成一截乱码 —— `echo \`date\`` 这种老式命令替换很常见。
+ * 进度行是给人扫一眼用的, 不是可复制执行的命令, 丢掉反引号可以接受。
+ */
 function clip(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim();
+  const flat = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
   return flat.length > MAX_DETAIL ? `${flat.slice(0, MAX_DETAIL)}…` : flat;
 }
 
@@ -3172,7 +3213,9 @@ class FakeChild extends EventEmitter {
 }
 
 const makeRunner = (child: FakeChild, overrides = {}) => {
-  const spawnFn = vi.fn(() => child);
+  // 用 mockReturnValue 而不是 vi.fn(() => child): 后者会把调用签名推成零参,
+  // 让 spawnFn.mock.calls[0][1] 过不了 tsc --noEmit
+  const spawnFn = vi.fn().mockReturnValue(child);
   const run = createAgentRunner({
     bin: 'claude',
     model: '',
@@ -4537,6 +4580,33 @@ Plan 1 完成时，下面每一条都成立：
 - `src/index.ts` 里没有任何业务判断（只有 wire 和一个 filter 分发）
 - `src/handler/message.ts` 里没有直接 import 任何飞书 SDK、`node:child_process` 或 `node:fs`
 
+## 终审后加固
+
+14 个任务全绿之后, 对整条分支做了一次跨模块终审, 下面这些缺陷只有在模块边界上才看得出来。
+修复已经落在代码里, 每条都带回归测试 (任务步骤本身不改)。
+
+| # | 问题 | 修法 | 为什么 |
+|-|-|-|-|
+| C1 | `WORKSPACE_DIR` 默认成 `process.cwd()`, 按 README 在仓库里 `npm start` 会把带 `.env` 的仓库根塞进 `bypassPermissions` 沙箱 | `WORKSPACE_DIR` 改成必填 (删掉 `.default()`); 新增 `src/config/workspace.ts` 的 `assertWorkspaceIsolated()`, 工作目录等于或是本程序目录的上级时启动即退出 | 任何飞书用户都能让模型读出 `FEISHU_APP_SECRET` 与 `sessions.json` |
+| C2 | `child.stdin` 没有 `error` 监听器, EPIPE 会走到 `uncaughtException` → `process.exit(1)` | `stdin.on('error')` 记 warn + `write()` 带错误回调 + `try/catch` 兜同步抛错; 失败降级成 close 分支的常规 `ok:false` | 会话 id 失效时 claude 秒退, 一个人的追问会带走全租户的 bot |
+| C3a | `void lock.run(...)` 没有 `.catch` | 装配点补 `.catch` 记 error | 边界必须自己兜底, 不能指望每个依赖都恰好吞了自己的错 |
+| C3b | 指令分支在 `try` 外面, `sessions.clear()` 的同步写盘抛错会穿透流水线 | 指令分支包进 `try/catch`, 失败给用户可读回复 | 磁盘满/权限问题时一句 `/new` 就能停机 |
+| I1 | `finalize`/`fail` 永远 resolve, 终态 patch 与续卡都失败时答案被静默丢弃 | 改成返回 `Promise<boolean>`, `message.ts` 拿到 `false` 时退回纯文本; 日志区分「终态丢失」与「延后补发」 | 否则「任何失败都变成一条可读的飞书消息」这句话端到端不成立 |
+| I2 | 进度块只受 30KB 字节闸门约束, 没有 3800 字的元素硬限 | `renderCard` 里按字符数从最早的进度行开始裁, 30KB 字节闸门保留 | ~70 次工具调用就会超 3800 字被飞书拒收, 续传的新卡同样超限 |
+| I4 | `index: dispatcher started` 在握手之前无条件打印 | 挪进 `WSClient` 的 `onReady`; `onError` 记 fatal, 重连记 warn/info; `start()` 的 rejection 接住记 fatal | README 与人工验收都拿这行当存活证据, 不真实等于没有存活检查 |
+| I5 | 21 个测试文件全部止步于单模块边界, `src/index.ts` 的 wiring 没有任何覆盖 | 新增 `tests/integration/message-flow.test.ts`: 真 parse → 真 filter → 真 ChatLock → 真 pipeline, 只假 `FeishuApi` 与 `spawnFn` (喂真实 NDJSON) | C3 就是一个任务级测试抓不到的 wiring 缺陷 |
+| I6 | `stripMentions` 按数组顺序剥离, `@_user_1` 会吃掉 `@_user_10` 的前缀 | 先按 `key.length` 倒序再剥 | 10 人以上的群会往 prompt 里注入一个孤立的 `0` |
+| I7 | 只有群白名单, 私聊完全没有闸门 | 新增 `ALLOWED_USERS` (留空 = 允许全部人) + `parseAllowedUsers()`, 在 `filter` 的 `self` 之后判定, 新增 `user-not-allowed` | Plan 3 的审批闸门落地前, 这是唯一能挡住「租户内任何人拿到本机 shell」的开关 |
+| 小 | `sessions.set` 排在 `card.finalize` 前面 | 先交付再落盘, 落盘失败单独 catch 记 error | 一次 fs 抛错不该吃掉已经算出来的答案 |
+| 小 | Typing 表情失败记 debug | 改记 warn | 默认 `LOG_LEVEL=info` 下操作者永远看不到权限缺失 |
+| 小 | README 只写了 `im:message` 权限, 也没提 `WORKSPACE_DIR` | 补齐权限说明、`WORKSPACE_DIR`、排错表, 并加安全须知 (审批闸门落地前不要全租户发布) | — |
+
+刻意不在本轮修的 (留给后续计划, 改动会动到 Plan 2-4 依赖的契约): 超时与 `ChatLock` 的交互
+(runner 超时即 resolve, 子进程还能再活 3 秒, 快速追问可能 `--resume` 一个将死进程持有的会话) —— 归 Plan 4。
+
+> 注: `WORKSPACE_DIR=cwd` 这条默认值来自 Global Constraints (抄自 spec), C1 是对它的**有意推翻**;
+> 现在它没有默认值, 缺失即启动失败。
+
 ## 与后续计划的接口约定
 
 后面三份计划会从这些地方接进来，实现时不要改动它们的签名：
@@ -4550,3 +4620,6 @@ Plan 1 完成时，下面每一条都成立：
 | `createAgentRunner` 追加 `settingsFile` 字段（`--settings`） | Plan 3 注入 PreToolUse hook 与 skillOverrides |
 | `startDispatcher` 追加 `card.action.trigger` 订阅 | Plan 3 审批卡片按钮回调 |
 | `src/index.ts` 装配审批服务与 pid / 健康探针 | Plan 3 / Plan 4 |
+| `WORKSPACE_DIR` 是**必填**, 且启动时经 `assertWorkspaceIsolated()` 校验 (不能是本程序目录或其上级) | Plan 2 的 `REPO_PATHS` 挂载在它之上叠加, 不要恢复 `cwd` 默认值 |
+| `ALLOWED_USERS`（open_id 逗号分隔, **留空 = 允许全部人**）+ `parseAllowedUsers()` + `filter` 的 `user-not-allowed` | Plan 3 的审批闸门接管前的临时人闸; 落地后由审批策略决定是否保留 |
+| `StreamCardHandle.finalize/fail` 返回 `Promise<boolean>`（false = 终态没送达, 调用方须退回纯文本） | Plan 2/3 复用卡片句柄时必须继续尊重这个返回值 |
